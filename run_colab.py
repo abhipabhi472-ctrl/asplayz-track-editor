@@ -17,8 +17,12 @@ for line in ps.stdout.splitlines():
                 except Exception:
                     pass
 
-BOT_PATH = "/content/asplayz-track-editor/bot.py"
-LOG_PATH = "/content/asplayz-track-editor/bot.log"
+BASE_DIR = "/content/asplayz-track-editor"
+os.makedirs(os.path.join(BASE_DIR, "downloads"), exist_ok=True)
+os.makedirs(os.path.join(BASE_DIR, "outputs"), exist_ok=True)
+
+BOT_PATH = os.path.join(BASE_DIR, "bot.py")
+LOG_PATH = os.path.join(BASE_DIR, "bot.log")
 
 with open(LOG_PATH, "w", encoding="utf-8") as lf:
     proc = subprocess.Popen(

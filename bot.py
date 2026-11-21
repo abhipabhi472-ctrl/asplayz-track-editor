@@ -24,11 +24,14 @@ app = Client(
 
 sessions, user_prefs, last_progress, speed_state = {}, {}, {}, {}
 
+
 def get_dest(uid):
     return user_prefs.get(uid, "gofile")
 
+
 def set_dest(uid, d):
     user_prefs[uid] = "telegram" if d == "telegram" else "gofile"
+
 
 def fmt_sz(n):
     if not n or n <= 0:
@@ -39,10 +42,12 @@ def fmt_sz(n):
         i += 1
     return f"{v:.2f} {u[i]}"
 
+
 def bar(pct):
     p = max(0.0, min(100.0, pct))
     f = int(round(p / 100.0 * 12))
     return ("■" * f) + ("□" * (12 - f))
+
 
 def clean_paths(*paths):
     for p in paths:
@@ -52,6 +57,7 @@ def clean_paths(*paths):
             shutil.rmtree(p, ignore_errors=True)
         elif os.path.exists(p):
             os.remove(p)
+
 
 def clean_sess(uid):
     s = sessions.pop(uid, None)
@@ -64,6 +70,7 @@ def clean_sess(uid):
     for sub in s.get("added_subs") or []:
         clean_paths(sub.get("path"))
 
+
 async def edit_msg(msg, txt, kb=None):
     if not msg:
         return
@@ -73,6 +80,7 @@ async def edit_msg(msg, txt, kb=None):
         pass
     except Exception as e:
         print(f"[edit_err] {e}", flush=True)
+
 
 async def show_prog(msg, key, title, done, tot, pct):
     now = time.monotonic()
@@ -90,12 +98,74 @@ async def show_prog(msg, key, title, done, tot, pct):
     body = f"**{title}**\n`[{bar(pct)}]` **{pct:.1f}%**\nSize: `{fmt_sz(done)}` / `{tot_s}`\nSpeed: `{spd_s}`"
     await edit_msg(msg, body, InlineKeyboardMarkup([[InlineKeyboardButton("Cancel", callback_data="cancel_job")]]))
 
+
+def url_fname(u):
+    n = re.sub(r'[\\/:*?"<>|]+', "_", os.path.basename(unquote(urlparse(u).path or ""))).strip()
+    if not n:
+        n = f"video_{int(time.time())}.mkv"
+    return n if "." in n else n + ".mkv"
+
+
+async def download_from_url(uid, url, status_msg):
+    sess = sessions.get(uid)
+    if not sess:
+        return
+    raw_name = url_fname(url)
+    os.makedirs(DL_DIR, exist_ok=True)
+    out_path = os.path.join(DL_DIR, f"url_{uid}_{int(time.time())}_{raw_name}")
+    sess["name"] = sess["out_name"] = raw_name
+    sess["path"] = out_path
+    pkey = f"dl_url_{uid}_{status_msg.id}"
+    last_progress.pop(pkey, None)
+    speed_state.pop(pkey, None)
+    try:
+        await edit_msg(
+            status_msg,
+            f"**Downloading...**\n`{raw_name}`",
+            InlineKeyboardMarkup([[InlineKeyboardButton("Cancel", callback_data="cancel_job")]]),
+        )
+        timeout = aiohttp.ClientTimeout(total=None, sock_connect=30, sock_read=120)
+        headers = {"User-Agent": "Mozilla/5.0"}
+        async with aiohttp.ClientSession(timeout=timeout, headers=headers) as http:
+            async with http.get(url, allow_redirects=True) as resp:
+                if resp.status >= 400:
+                    raise RuntimeError(f"HTTP {resp.status}")
+                cl = resp.headers.get("Content-Length")
+                tot_sz = int(cl) if (cl and cl.isdigit() and int(cl) > 0) else 0
+                if tot_sz > TWO_GB:
+                    sess["dest"] = "gofile"
+                written = 0
+                speed_state[pkey] = {"t": time.monotonic(), "d": 0, "spd": 0.0}
+                with open(out_path, "wb") as fp:
+                    async for chunk in resp.content.iter_chunked(1024 * 1024):
+                        if uid not in sessions or sessions[uid] is not sess:
+                            raise RuntimeError("Cancelled")
+                        if not chunk:
+                            continue
+                        fp.write(chunk)
+                        written += len(chunk)
+                        pct_now = min(99.5, (written / tot_sz * 100.0)) if tot_sz > 0 else 0.0
+                        await show_prog(status_msg, pkey, f"Downloading: {raw_name}", written, tot_sz, pct_now)
+                pct_done = 100.0 if tot_sz > 0 else 0.0
+                await show_prog(status_msg, pkey, f"Downloading: {raw_name}", written, tot_sz or written, pct_done)
+        if not os.path.exists(out_path) or os.path.getsize(out_path) <= 0:
+            raise RuntimeError("Empty file downloaded")
+        if os.path.getsize(out_path) > TWO_GB:
+            sess["dest"] = "gofile"
+        await open_menu(uid, status_msg)
+    except Exception as e:
+        clean_paths(out_path)
+        if uid in sessions and sessions[uid] is sess:
+            await edit_msg(status_msg, f"Link failed: `{e}`")
+
+
 def aud_order(s):
     t = len(s.get("audios") or [])
     o = s.get("audio_order")
     if not isinstance(o, list) or len(o) != t or set(o) != set(range(t)):
         s["audio_order"] = list(range(t))
     return s["audio_order"]
+
 
 async def probe(path):
     p = await asyncio.create_subprocess_exec(
@@ -119,46 +189,96 @@ async def probe(path):
     ext = os.path.splitext(path)[1].lstrip(".").lower() or "mkv"
     return {"audios": audios, "subs": subs, "ext": ext}
 
+
 async def gofile_up(path, msg, uid):
     fsize = os.path.getsize(path)
     fname = os.path.basename(path)
     servers = ["store1", "store2", "store3", "store4"]
-    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20)) as http:
-        async with http.get("https://api.gofile.io/servers") as r:
-            sd = await r.json()
-            got = [x["name"] for x in ((sd.get("data") or {}).get("servers") or []) if isinstance(x, dict) and x.get("name")]
-            if got:
-                servers = got
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as http:
+            async with http.get("https://api.gofile.io/servers") as r:
+                sd = await r.json()
+                got = [x["name"] for x in ((sd.get("data") or {}).get("servers") or []) if isinstance(x, dict) and x.get("name")]
+                if got:
+                    servers = got
+    except Exception:
+        pass
+
     last_err = None
-    for srv in servers[:5]:
+    for srv in servers[:6]:
         pkey = f"gf_{uid}_{srv}_{int(time.monotonic()*1000)}"
+        last_progress.pop(pkey, None)
+        speed_state.pop(pkey, None)
+        prog_file = f"{path}.{srv}.prog"
+        clean_paths(prog_file)
         title = f"Uploading {fname} ({srv})..."
         await show_prog(msg, pkey, title, 0, fsize, 0.0)
-        cmd = ["curl", "-sS", "-L", "--max-time", "7200", "-F", f"file=@{path};filename={fname}", f"https://{srv}.gofile.io/uploadFile"]
-        p = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-        if uid in sessions:
-            sessions[uid]["proc"] = p
-        t0 = time.monotonic()
-        spd = 2.5 * 1024 * 1024
-        while p.returncode is None:
-            await asyncio.sleep(2.0)
-            est = min(fsize, int((time.monotonic() - t0) * spd))
-            pct = min(99.0, (est / fsize * 100.0)) if fsize > 0 else 0.0
-            speed_state[pkey] = {"t": time.monotonic() - 1.0, "d": max(0, est - int(spd)), "spd": spd}
-            await show_prog(msg, pkey, title, est, fsize, pct)
-        out_b, _ = await p.communicate()
-        if uid in sessions:
-            sessions[uid]["proc"] = None
-        if p.returncode != 0:
-            last_err = f"curl {p.returncode}"
+
+        cmd = [
+            "curl", "-sS", "-L",
+            "--speed-limit", "200000", "--speed-time", "25",
+            "--max-time", "7200",
+            "-F", f"file=@{path};filename={fname}",
+            f"https://{srv}.gofile.io/uploadFile",
+        ]
+        try:
+            with open(prog_file, "w", encoding="utf-8") as pf:
+                p = await asyncio.create_subprocess_exec(
+                    *cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=pf,
+                )
+            if uid in sessions:
+                sessions[uid]["proc"] = p
+
+            while p.returncode is None:
+                await asyncio.sleep(1.5)
+                cur_bytes = 0
+                cur_spd = 0.0
+                if os.path.exists(prog_file):
+                    try:
+                        raw = open(prog_file, "rb").read().decode("utf-8", errors="ignore")
+                        parts = [x.strip() for x in re.split(r"[\r\n]+", raw) if x.strip()]
+                        if parts:
+                            last_line = parts[-1]
+                            m_pct = re.search(r"(\d+(?:\.\d+)?)%", last_line)
+                            if m_pct:
+                                pct_v = float(m_pct.group(1))
+                                cur_bytes = min(fsize, int(fsize * pct_v / 100.0))
+                            m_spd = re.search(r"(\d+(?:\.\d+)?)([KMG])", last_line)
+                            if m_spd:
+                                val = float(m_spd.group(1))
+                                unit = m_spd.group(2)
+                                mult = {"K": 1024, "M": 1024**2, "G": 1024**3}.get(unit, 1)
+                                cur_spd = val * mult
+                    except Exception:
+                        pass
+                pct_show = min(99.5, (cur_bytes / fsize * 100.0)) if fsize > 0 else 0.0
+                speed_state[pkey] = {"t": time.monotonic(), "d": cur_bytes, "spd": cur_spd}
+                await show_prog(msg, pkey, title, cur_bytes, fsize, pct_show)
+
+            out_b, _ = await p.communicate()
+            if uid in sessions:
+                sessions[uid]["proc"] = None
+            clean_paths(prog_file)
+
+            if p.returncode != 0:
+                last_err = f"curl exit {p.returncode} on {srv}"
+                continue
+
+            res = json.loads((out_b or b"").decode("utf-8", errors="ignore"))
+            lnk = (res.get("data") or {}).get("downloadPage")
+            if res.get("status") == "ok" and lnk:
+                await show_prog(msg, pkey, title, fsize, fsize, 100.0)
+                return lnk
+            last_err = res.get("status") or f"bad response from {srv}"
+        except Exception as ex:
+            clean_paths(prog_file)
+            last_err = f"{srv}: {ex}"
             continue
-        res = json.loads((out_b or b"").decode("utf-8", errors="ignore"))
-        lnk = (res.get("data") or {}).get("downloadPage")
-        if res.get("status") == "ok" and lnk:
-            await show_prog(msg, pkey, title, fsize, fsize, 100.0)
-            return lnk
-        last_err = res.get("status") or srv
+
     raise RuntimeError(f"Gofile failed: {last_err}")
+
 
 def welcome_ui(uid):
     is_gf = get_dest(uid) == "gofile"
@@ -179,6 +299,7 @@ def welcome_ui(uid):
         [InlineKeyboardButton("Close", callback_data="close_menu")],
     ])
     return txt, kb
+
 
 def menu_ui(uid, view="main"):
     s = sessions.get(uid)
@@ -245,6 +366,7 @@ def menu_ui(uid, view="main"):
     ])
     return txt, kb
 
+
 async def open_menu(uid, msg):
     s = sessions.get(uid)
     if not s:
@@ -255,6 +377,7 @@ async def open_menu(uid, msg):
     aud_order(s)
     t, k = menu_ui(uid, "main")
     await edit_msg(msg, t, k)
+
 
 async def run_job(uid, msg):
     s = sessions.get(uid)
@@ -321,17 +444,20 @@ async def run_job(uid, msg):
         await msg.delete()
     clean_sess(uid)
 
+
 @app.on_message(filters.command("start"))
 async def start_cmd(_, m):
     uid = m.from_user.id if m.from_user else 0
     t, k = welcome_ui(uid)
     await m.reply_text(t, reply_markup=k)
 
+
 @app.on_message(filters.command("cancel"))
 async def cancel_cmd(_, m):
     uid = m.from_user.id if m.from_user else 0
     clean_sess(uid)
     await m.reply_text("Cancelled.")
+
 
 @app.on_message(filters.document | filters.video | filters.text)
 async def on_msg(_, m):
@@ -357,6 +483,20 @@ async def on_msg(_, m):
                 tx, k = menu_ui(uid, "main")
                 await m.reply_text(tx, reply_markup=k)
                 return
+        if t.startswith("http://") or t.startswith("https://"):
+            if uid in sessions:
+                clean_sess(uid)
+            sm = await m.reply_text("Preparing link download...")
+            fn = url_fname(t)
+            sessions[uid] = {
+                "name": fn, "out_name": fn, "path": None, "out_path": None,
+                "audios": [], "subs": [], "renamed_audios": {}, "removed_audios": set(),
+                "removed_subs": set(), "added_subs": [], "audio_order": [],
+                "await_mode": None, "await_idx": None,
+                "dest": get_dest(uid), "proc": None,
+            }
+            asyncio.create_task(download_from_url(uid, t, sm))
+            return
     media = m.video or m.document
     if not media:
         return
@@ -383,15 +523,18 @@ async def on_msg(_, m):
         "dest": "gofile" if tot > TWO_GB else get_dest(uid), "proc": None,
     }
     pk = f"dl_{uid}_{sm.id}"
+
     async def _cb(cur, t):
         tsz = t if (t and t > 0) else tot
         await show_prog(sm, pk, f"Downloading: {safe_fn}", cur, tsz, (cur / tsz * 100.0) if tsz > 0 else 0.0)
+
     saved = await m.download(file_name=dp, progress=_cb)
     act = os.path.abspath(saved) if saved else dp
     sessions[uid]["path"] = act
     if os.path.getsize(act) > TWO_GB:
         sessions[uid]["dest"] = "gofile"
     await open_menu(uid, sm)
+
 
 @app.on_callback_query()
 async def on_cb(_, cq: CallbackQuery):
@@ -521,6 +664,9 @@ async def on_cb(_, cq: CallbackQuery):
         print(f"[cb_err] {data} -> {e}", flush=True)
         await cq.answer(f"Err: {e}", show_alert=True)
 
+
 if __name__ == "__main__":
+    os.makedirs(DL_DIR, exist_ok=True)
+    os.makedirs(OUT_DIR, exist_ok=True)
     print(">>> BOT_STARTED", flush=True)
     app.run()
